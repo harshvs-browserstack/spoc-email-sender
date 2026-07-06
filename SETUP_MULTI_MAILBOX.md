@@ -1,120 +1,148 @@
-# Sending as other mailboxes (Distribution List members)
+# Multi-mailbox sending (split one alias across several mailboxes)
 
-Your current script sends every email with:
+## What this solves
 
-```js
-Gmail.Users.Messages.send({ raw: rawPayload }, "me");
-```
+You want 5 recipients to receive mail **from person X**, but split the sending
+across mailboxes to stay under Gmail's per-account daily limits — e.g. 2 sent
+from **your** mailbox (posing as X) and 3 from **Z's** mailbox (posing as X).
 
-The `"me"` is locked to the single account that authorized the script. The
-Apps Script "advanced Gmail service" only ever uses that account's OAuth
-token, so it can never send as anyone else.
+The trick is that two things are independent:
 
-To send **as other people** (your SPOCs / DL members) you replace that call
-with a thin **wrapper around the Gmail REST API** that authenticates as each
-SPOC individually. That impersonation is done with a **Service Account** that
-your Workspace admin grants **Domain-Wide Delegation (DWD)**.
+| Concept | Controlled by | Column |
+|---------|---------------|--------|
+| **Who it appears from** (the identity) | the `From:` header = the alias | `Alias Email` |
+| **Which mailbox actually sends** (whose quota + Sent folder) | which account's token we use | `Send From` |
 
-The mail lands in the SPOC's own **Sent** folder and appears fully as them —
-not "on behalf of".
+- `Alias Email` = **X** for all 5 rows → everyone sees "From: X".
+- `Send From` = **your address** on 2 rows, **Z's address** on 3 rows.
 
-> **Authorization matters.** DWD lets code send as any user in the domain, so
-> it can only be enabled by a **Super Admin**, and you should have the SPOCs'
-> (and your admin's) agreement before sending on their behalf. That admin
-> approval step is the control point — you cannot do this alone, by design.
+Gmail's sending quota is charged to the **actual sending mailbox**, *not* to the
+alias. So sending as X from two different mailboxes genuinely gives you two
+separate quotas — exactly the point of the split.
 
-> **A Distribution List / Google Group is not a mailbox.** You can't
-> "impersonate a group" — a group has no Sent folder. You impersonate the
-> **individual member users** of the DL. If you want the *From* to read as the
-> group address, that's a separate "send-as alias" configured on each user.
+## How the code decides the path (already wired in `code.gs`)
+
+For each row, `sendOriginals` / `sendFollowUps` look at `Send From`:
+
+- **blank, or = the account running the script** → sends natively via the
+  built-in Gmail service (`"me"`), exactly like before. **No service account
+  needed for these rows.**
+- **any other mailbox** → impersonates it via a Service Account with
+  Domain-Wide Delegation and sends through the Gmail REST API.
+
+Either way, `buildRawMime` puts the alias in the `From:` header.
 
 ---
 
-## Part A — Google Cloud (create the service account)
+## The one hard requirement: the alias must be verified on EACH sending mailbox
 
-1. Go to <https://console.cloud.google.com> → create or pick a project.
+For "From: X" to actually stick, **X must be a verified "Send mail as" address
+on every mailbox that sends as X.** This is the same Gmail feature you already
+use on your own account (Settings → Accounts → *Send mail as*).
+
+- Your mailbox already has X verified (that's your current alias setup). ✅
+- **Z's mailbox must ALSO have X added and verified** under Z's
+  Settings → Accounts → *Send mail as*.
+
+If a mailbox tries to send as an alias it hasn't verified, Gmail rewrites the
+From to the real account (or the send fails). Two ways to add it on Z:
+
+1. **Z does it manually** in their Gmail settings and clicks the verification
+   link (simplest; works for any address).
+2. **Admin/API**, if X is a domain-owned address (like a Group/alias
+   `x@browserstack.com`): a domain-owned send-as is auto-verified. This can be
+   done with the Gmail API `users.settings.sendAs.create` (scope
+   `gmail.settings.sharing`) or by an admin.
+
+> If X is one specific person's personal address, option 1 (they verify it) is
+> the reliable route. Get their consent first — you're sending as them.
+
+---
+
+## Setup — only needed for the "other mailbox" (Z) part
+
+Sending from **your own** mailbox as X needs nothing new. The steps below only
+enable sending from **other people's** mailboxes (Z, and any future SPOC).
+
+### Part A — Google Cloud (create the service account)
+
+1. <https://console.cloud.google.com> → create/pick a project.
 2. **APIs & Services → Library →** enable **Gmail API**.
-3. **APIs & Services → Credentials → Create credentials → Service account.**
-   Give it a name (e.g. `spoc-mailer`) and create it. No roles needed.
-4. Open the service account → **Keys → Add key → Create new key → JSON.**
-   A JSON file downloads. Keep it safe. You need two fields from it:
-   - `client_email`  (e.g. `spoc-mailer@yourproject.iam.gserviceaccount.com`)
-   - `private_key`   (the `-----BEGIN PRIVATE KEY-----...` block)
-5. On the service account **Details** tab, copy the **Unique ID / Client ID**
-   (a long number) — you need it for the admin step.
+3. **Credentials → Create credentials → Service account** (e.g. `spoc-mailer`).
+4. Open it → **Keys → Add key → Create new key → JSON.** Download it. You need:
+   - `client_email` (…@…iam.gserviceaccount.com)
+   - `private_key` (`-----BEGIN PRIVATE KEY-----…`)
+5. On the **Details** tab, copy the numeric **Unique ID / Client ID**.
 
-## Part B — Admin Console (authorize Domain-Wide Delegation)
+### Part B — Admin Console (authorize DWD) — needs a Super Admin
 
-Done by a **Super Admin** at <https://admin.google.com>:
+At <https://admin.google.com>:
 
 1. **Security → Access and data control → API controls → Domain-wide
-   delegation → Manage domain-wide delegation → Add new.**
-2. **Client ID:** paste the service account's numeric Client ID from A.5.
-3. **OAuth scopes:** paste exactly (comma-separated):
-
+   delegation → Manage → Add new.**
+2. **Client ID:** the numeric ID from A.5.
+3. **OAuth scopes:**
    ```
    https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/gmail.readonly
    ```
+4. Authorize. (Can take minutes to ~24h to propagate.)
 
-4. Authorize. (Propagation can take a few minutes to ~24h.)
+### Part C — Apps Script
 
-## Part C — Apps Script (store the credentials, add the code)
+1. **Project Settings → Script Properties**, add two:
+   - `SA_CLIENT_EMAIL` = the `client_email`.
+   - `SA_PRIVATE_KEY`  = the full `private_key` (paste with BEGIN/END lines).
+2. Add `multi_mailbox.gs` to the project (it sits alongside `code.gs`).
+3. Keep the `script.external_request` scope available in `appsscript.json`.
 
-1. In your Apps Script project: **Project Settings → Script Properties → Add
-   script property** twice:
-   - `SA_CLIENT_EMAIL` = the `client_email` from the JSON.
-   - `SA_PRIVATE_KEY`  = the full `private_key` value from the JSON
-     (paste it including the `BEGIN/END` lines; literal `\n` are handled).
-2. Add the two files from this repo to your project:
-   - `multi_mailbox.gs`         — the API wrapper (token minting + send/read).
-   - `multi_mailbox_senders.gs` — multi-mailbox `sendOriginalsMulti()` /
-     `sendFollowUpsMulti()` (uses your existing `getColIndex` helper).
-3. Make sure `appsscript.json` still lists the Gmail scopes your project uses.
-   The wrapper itself only needs `UrlFetchApp` + `Script Properties`, but keep
-   `https://www.googleapis.com/auth/script.external_request` available.
+### Part D — Sheet
 
-## Part D — Sheet changes
+Add one column to **Invitelist**:
 
-Add one column to your **Invitelist** tab:
+| Column        | Fill with                                                        |
+|---------------|-----------------------------------------------------------------|
+| **Send From** | The mailbox that should send this row. Blank = your own mailbox. |
 
-| Column        | Meaning                                                        |
-|---------------|---------------------------------------------------------------|
-| **Send From** | The SPOC mailbox to send as (a DL member, real domain user).  |
+`Alias Email` stays as X on every row. `Sender Name` = display name for X.
 
-`Sender Name` (optional) still controls the display name. The address in
-**Send From** must be the SPOC's own address, or a send-as alias verified on
-that SPOC's account — you cannot forge an arbitrary From.
+Example for your 5-recipient case:
 
-## Part E — Test, then wire the menu
+| Email            | Alias Email | Send From          |
+|------------------|-------------|--------------------|
+| recipient1@…     | x@domain    | *(blank = you)*    |
+| recipient2@…     | x@domain    | *(blank = you)*    |
+| recipient3@…     | x@domain    | z@domain           |
+| recipient4@…     | x@domain    | z@domain           |
+| recipient5@…     | x@domain    | z@domain           |
 
-1. In the editor, open `multi_mailbox.gs`, edit the two vars in
-   `mmbxSelfTest()`, and **Run** it. You should get a test mail that appears
-   to come from the SPOC. Authorize the `external_request` scope when prompted.
-2. Point your menu at the new functions:
+### Part E — Test
 
-   ```js
-   .addItem("1. Send Original Emails", "sendOriginalsMulti")
-   .addItem("3. Send Follow Ups",      "sendFollowUpsMulti")
-   ```
+Edit the vars in `mmbxSelfTest()` (in `multi_mailbox.gs`) to `TEST_ACCOUNT = z`,
+`TEST_ALIAS = x`, and **Run** it. Authorize the `external_request` scope when
+prompted. You should receive a mail that comes from Z's mailbox but shows
+"From: X".
 
 ---
 
 ## Troubleshooting
 
-| Error | Cause / fix |
-|-------|-------------|
-| `unauthorized_client` | DWD not approved (or wrong Client ID / scopes) in Admin Console, or still propagating. Recheck Part B. |
-| `invalid_grant` | `sub` (Send From) is not a real user in the domain, or clock skew. |
-| `Delegation denied for <email>` | The scope isn't authorized for DWD, or you're impersonating outside your domain. |
-| `403 ... failedPrecondition` on send | The `From` isn't an address that account may send as. Use the SPOC's own address or a verified alias. |
-| `Missing SA_CLIENT_EMAIL / SA_PRIVATE_KEY` | Script Properties not set — see Part C.1. |
+| Symptom | Cause / fix |
+|---------|-------------|
+| From shows Z, not X | X isn't a verified *Send mail as* alias on Z's account. Add + verify it (see above). |
+| `unauthorized_client` | DWD not approved / wrong Client ID or scopes / still propagating (Part B). |
+| `invalid_grant` | `Send From` isn't a real user in the domain, or clock skew. |
+| `403 failedPrecondition` on send | The From alias isn't permitted on that account — same fix as row 1. |
+| `Missing SA_CLIENT_EMAIL / SA_PRIVATE_KEY` | Script Properties not set (Part C.1). |
 
-## Notes on threading & the reply report
+## Notes
 
-- Thread IDs and message IDs are **per-mailbox**. Because the original and its
-  follow-up are both sent from the *same* SPOC, the stored `Gmail Thread ID`
-  stays valid for that SPOC — follow-ups thread correctly.
-- Replies now land in the **SPOC's** inbox, not yours. `sendFollowUpsMulti()`
-  already checks for replies via the API (`mmbxThreadHasReply_`). If you also
-  want a cross-mailbox **Reply Report**, rebuild it on `mmbxGetThread_(sendFrom,
-  threadId)` per row instead of `GmailApp` (which only sees your mailbox).
+- **Threading is per-mailbox.** A row's original and follow-up must use the same
+  `Send From`, or the stored Thread/Message IDs won't match. Don't change
+  `Send From` on a row after the original has gone out.
+- **Reply detection** in follow-ups already checks the correct mailbox (yours
+  via GmailApp, others via the API). The **Reply Report** still only reads your
+  own mailbox — replies to X sent from Z land in **Z's** inbox. To include those
+  you'd rebuild `refreshReplyReport` on `mmbxGetThread_(sendFrom, threadId)` per
+  row. Ask if you want that.
+- **Quotas:** ~2,000 external recipients/day per Workspace user. Splitting
+  across N mailboxes multiplies that. The alias does not get its own quota.

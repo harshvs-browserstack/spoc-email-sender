@@ -168,51 +168,94 @@ function mmbxThreadHasReply_(fromEmail, threadId) {
   return !!(t && t.messages && t.messages.length > 1);
 }
 
+// ============================================================
+//  HYBRID DISPATCHERS  (used by code.gs sendOriginals / sendFollowUps)
 // ------------------------------------------------------------
-//  Build a raw MIME message whose From is the SPOC mailbox.
-//  IMPORTANT: `fromEmail` must be the SPOC's own address (or a
-//  send-as alias verified on THAT account) — you cannot forge an
-//  arbitrary From, Gmail will reject or rewrite it.
-// ------------------------------------------------------------
-function buildRawMimeMulti(fromEmail, senderName, to, cc, subject, htmlBody, inReplyToMsgId) {
-  var raw = [];
+//  These pick the send path per row based on the "Send From" column:
+//    - blank OR your own address  -> native Gmail service ("me"),
+//      exactly as before. No service account needed for these rows.
+//    - any other domain mailbox   -> impersonate it via DWD.
+//  In BOTH cases the From header (the alias) is set inside
+//  buildRawMime, so the recipient always sees the alias.
+// ============================================================
 
-  var fromStr = senderName ? '"' + senderName + '" <' + fromEmail + '>' : fromEmail;
-  raw.push("From: " + fromStr);
-  raw.push("To: " + to);
-  if (cc) raw.push("Cc: " + cc);
+// Lowercased email of the account running the script.
+function mmbxActiveUser_() {
+  return String(Session.getActiveUser().getEmail() || "").trim().toLowerCase();
+}
 
-  var encodedSubject = "=?UTF-8?B?" + Utilities.base64Encode(Utilities.newBlob(subject).getBytes()) + "?=";
-  raw.push("Subject: " + encodedSubject);
+// Is this row sent from the script owner's own mailbox?
+function mmbxIsSelf_(account) {
+  account = String(account || "").trim().toLowerCase();
+  return !account || account === mmbxActiveUser_();
+}
 
-  if (inReplyToMsgId) {
-    raw.push("In-Reply-To: " + inReplyToMsgId);
-    raw.push("References: "  + inReplyToMsgId);
+// Unified send. `account` = the actual sending mailbox ("" => your own).
+// `raw` = base64url MIME (From already set to the alias). Returns {id, threadId}.
+function sendFromAccount_(account, raw, threadId) {
+  if (mmbxIsSelf_(account)) {
+    var opt = { raw: raw };
+    if (threadId) opt.threadId = threadId;
+    var r = Gmail.Users.Messages.send(opt, "me");
+    return { id: r.id, threadId: r.threadId };
   }
+  var r2 = mmbxSendAs_(account, raw, threadId);
+  return { id: r2.id, threadId: r2.threadId };
+}
 
-  raw.push("MIME-Version: 1.0");
-  raw.push("Content-Type: text/html; charset=UTF-8");
-  raw.push("");
-  raw.push(htmlBody);
+// Unified RFC Message-ID fetch for a message we just sent.
+function rfcMessageIdFromAccount_(account, gmailId) {
+  if (mmbxIsSelf_(account)) {
+    try {
+      var meta = Gmail.Users.Messages.get("me", gmailId, { format: "metadata", metadataHeaders: ["Message-ID"] });
+      var hs = (meta.payload && meta.payload.headers) || [];
+      for (var h = 0; h < hs.length; h++) if (hs[h].name === "Message-ID") return hs[h].value;
+    } catch (e) {}
+    return "";
+  }
+  return mmbxGetRfcMessageId_(account, gmailId);
+}
 
-  return Utilities.base64EncodeWebSafe(Utilities.newBlob(raw.join("\r\n")).getBytes());
+// Unified reply check: does the thread hold more than the 1 message we sent?
+function threadHasReplyFromAccount_(account, threadId) {
+  if (mmbxIsSelf_(account)) {
+    var t = GmailApp.getThreadById(threadId);
+    return !!(t && t.getMessageCount() > 1);
+  }
+  return mmbxThreadHasReply_(account, threadId);
+}
+
+// Unified: RFC Message-ID of the FIRST message in a thread (recovery path).
+function firstMessageIdFromAccount_(account, threadId) {
+  if (mmbxIsSelf_(account)) {
+    var t = GmailApp.getThreadById(threadId);
+    if (!t) return "";
+    var raw = t.getMessages()[0].getRawContent();
+    var m = raw.match(/^Message-ID:\s*(<[^>]+>)/im);
+    return m ? m[1].trim() : "";
+  }
+  var th = mmbxGetThread_(account, threadId);
+  if (th && th.messages && th.messages.length) return mmbxGetRfcMessageId_(account, th.messages[0].id);
+  return "";
 }
 
 // ------------------------------------------------------------
-//  Quick self-test. Run this once from the editor after setup:
-//  it mints a token for one SPOC and sends a test mail to yourself.
-//  Edit the two vars below before running.
+//  Quick self-test. Edit the vars, then Run once from the editor.
+//  Sends a mail to yourself FROM another mailbox, posing as the alias.
 // ------------------------------------------------------------
 function mmbxSelfTest() {
-  var TEST_SENDER = "spoc@yourdomain.com";       // a DL member mailbox to impersonate
-  var TEST_TO     = Session.getActiveUser().getEmail();
+  var TEST_ACCOUNT = "z@yourdomain.com";        // the mailbox that actually sends (impersonated)
+  var TEST_ALIAS   = "x@yourdomain.com";        // the alias shown in From (must be verified on TEST_ACCOUNT)
+  var TEST_NAME    = "Person X";
+  var TEST_TO      = Session.getActiveUser().getEmail();
 
-  var raw = buildRawMimeMulti(
-    TEST_SENDER, "Multi-Mailbox Test", TEST_TO, "",
-    "Multi-mailbox test",
-    "This message was sent programmatically <b>as " + TEST_SENDER + "</b>.",
-    null
+  // buildRawMime lives in code.gs and sets From to the alias.
+  var raw = buildRawMime(
+    TEST_TO, "", TEST_ALIAS, TEST_NAME,
+    "Multi-mailbox alias test",
+    "Sent from <b>" + TEST_ACCOUNT + "</b>'s mailbox, posing as <b>" + TEST_ALIAS + "</b>.",
+    null, null
   );
-  var res = mmbxSendAs_(TEST_SENDER, raw, null);
+  var res = sendFromAccount_(TEST_ACCOUNT, raw, null);
   Logger.log("Sent OK. Gmail id=%s threadId=%s", res.id, res.threadId);
 }

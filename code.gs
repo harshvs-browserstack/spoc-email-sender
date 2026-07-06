@@ -86,6 +86,7 @@ function sendOriginals() {
   var colMap = {
     email: getColIndex(sheet, headers, "Email"),
     firstName: getColIndex(sheet, headers, "First Name"),
+    sendFrom: getColIndex(sheet, headers, "Send From"),   // actual sending mailbox (blank = your own)
     senderName: getColIndex(sheet, headers, "Sender Name"),
     aliasEmail: getColIndex(sheet, headers, "Alias Email"),
     designation: getColIndex(sheet, headers, "Sender Designation"),
@@ -108,7 +109,8 @@ function sendOriginals() {
 
     var firstName = row[colMap.firstName];
     var body = row[colMap.body];
-    
+    var account = String(row[colMap.sendFrom] || "").trim(); // mailbox that actually sends
+
     // Personalize body
     var htmlBody = body.replace(/\{\[first name\]\}|\{\{first name\}\}/gi, firstName)
                        .replace(/\{\[sender designation\]\}|\{\{sender designation\}\}/gi, row[colMap.designation])
@@ -116,20 +118,16 @@ function sendOriginals() {
 
     try {
       var rawPayload = buildRawMime(
-        currentEmail, row[colMap.cc], row[colMap.aliasEmail], row[colMap.senderName], 
+        currentEmail, row[colMap.cc], row[colMap.aliasEmail], row[colMap.senderName],
         row[colMap.subject], htmlBody, null, null
       );
 
-      var sentResult = Gmail.Users.Messages.send({ raw: rawPayload }, "me");
-      
-      // Fetch RFC Message-ID
-      var rfcMsgId = "";
-      try {
-        var msgMeta = Gmail.Users.Messages.get("me", sentResult.id, { format: "metadata", metadataHeaders: ["Message-ID"] });
-        for (var h = 0; h < msgMeta.payload.headers.length; h++) {
-          if (msgMeta.payload.headers[h].name === "Message-ID") rfcMsgId = msgMeta.payload.headers[h].value;
-        }
-      } catch (metaErr) {}
+      // Send from your own mailbox OR (via impersonation) from someone else's.
+      // The From header is still the alias, set inside buildRawMime.
+      var sentResult = sendFromAccount_(account, rawPayload, null);
+
+      // Fetch RFC Message-ID (from whichever mailbox actually sent it)
+      var rfcMsgId = rfcMessageIdFromAccount_(account, sentResult.id);
 
       // Write back to sheet
       sheet.getRange(i + 1, colMap.status + 1).setValue("Sent").setBackground("#E8F5E9");
@@ -162,6 +160,7 @@ function sendFollowUps() {
   var colMap = {
     email: getColIndex(sheet, headers, "Email"),
     firstName: getColIndex(sheet, headers, "First Name"),
+    sendFrom: getColIndex(sheet, headers, "Send From"),   // actual sending mailbox (blank = your own)
     senderName: getColIndex(sheet, headers, "Sender Name"),
     aliasEmail: getColIndex(sheet, headers, "Alias Email"),
     designation: getColIndex(sheet, headers, "Sender Designation"),
@@ -183,6 +182,7 @@ function sendFollowUps() {
     var threadId = row[colMap.threadId];
     var msgId = row[colMap.msgId];
     var followUpContent = row[colMap.followUpBody];
+    var account = String(row[colMap.sendFrom] || "").trim(); // mailbox that sent the original
 
     // Skip if no email, no content, or if it's already sent/replied
     if (!currentEmail || !followUpContent || status === "sent (in thread)" || status === "already replied") continue;
@@ -193,17 +193,11 @@ function sendFollowUps() {
     }
 
     // --- NEW: Bulletproof Reply Detection ---
+    // Checks the thread in whichever mailbox actually sent the original.
+    // More than 1 message => a reply/bounce/manual response arrived, so abort.
     var hasReplied = false;
     try {
-      var thread = GmailApp.getThreadById(threadId);
-      if (thread) {
-        // If there is more than 1 message in this thread, it means the conversation
-        // has moved forward (a reply, an out-of-office bounce, or a manual response).
-        // In ALL of these cases, we abort the automated follow-up.
-        if (thread.getMessageCount() > 1) {
-          hasReplied = true;
-        }
-      }
+      hasReplied = threadHasReplyFromAccount_(account, threadId);
     } catch (e) {
       Logger.log("Error checking thread for " + currentEmail + ": " + e.message);
     }
@@ -217,15 +211,10 @@ function sendFollowUps() {
     // --- FALLBACK: Fetch missing Message ID if blank ---
     if (!msgId) {
       try {
-        var threadForMsg = GmailApp.getThreadById(threadId);
-        if (threadForMsg) {
-          var rawContent = threadForMsg.getMessages()[0].getRawContent();
-          var match = rawContent.match(/^Message-ID:\s*(<[^>]+>)/im);
-          if (match) {
-            msgId = match[1].trim();
-            sheet.getRange(i + 1, colMap.msgId + 1).setValue(msgId);
-            SpreadsheetApp.flush();
-          }
+        msgId = firstMessageIdFromAccount_(account, threadId);
+        if (msgId) {
+          sheet.getRange(i + 1, colMap.msgId + 1).setValue(msgId);
+          SpreadsheetApp.flush();
         }
       } catch (e) {
         Logger.log("Could not recover Message ID for " + currentEmail);
@@ -245,11 +234,11 @@ function sendFollowUps() {
 
     try {
       var rawPayload = buildRawMime(
-        currentEmail, row[colMap.cc], row[colMap.aliasEmail], row[colMap.senderName], 
+        currentEmail, row[colMap.cc], row[colMap.aliasEmail], row[colMap.senderName],
         "Re: " + row[colMap.subject], htmlBody, threadId, msgId
       );
 
-      Gmail.Users.Messages.send({ raw: rawPayload, threadId: threadId }, "me");
+      sendFromAccount_(account, rawPayload, threadId);
       
       sheet.getRange(i + 1, colMap.followUpStatus + 1).setValue("Sent (in thread)").setBackground("#E8F5E9");
       SpreadsheetApp.flush();
